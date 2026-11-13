@@ -8,8 +8,13 @@
 
 namespace deep_gemm::comm {
 
-// 60s timeout, at 2 GHz
-constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
+// Allow slow rendezvous after warm-up without changing the default hang timeout.
+#ifndef DG_BARRIER_TIMEOUT_SECONDS
+#define DG_BARRIER_TIMEOUT_SECONDS 60
+#endif
+
+// Timeout in cycles, at 2 GHz
+constexpr int64_t kNumTimeoutCycles = static_cast<int64_t>(DG_BARRIER_TIMEOUT_SECONDS) * 2000000000ll;
 
 // Spin until `pred()` holds; on timeout, `print_timeout()` runs before the assertion
 template <typename pred_t, typename print_timeout_t>
@@ -43,8 +48,8 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
             count_ptr, sm_idx == 0 ? (kFinishSumTag - (kNumSMs - 1)) : 1);
         uint32_t new_value;
         wait_until([&]() { return ((new_value = ptx::ld_acq(count_ptr)) ^ old_value) & kFinishSumTag; }, [&]() {
-            printf("DeepGEMM grid sync timeout: sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
-                   sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
+            printf("DeepGEMM grid sync timeout (%ds): sm=%u, thread=%u, grid_sync_idx=%u, old=%u, current=%u, expected_tag=%u\n",
+                   DG_BARRIER_TIMEOUT_SECONDS, sm_idx, thread_idx, kGridSyncIndex, old_value, new_value, old_value ^ kFinishSumTag);
         });
     }
     sync_scope();
@@ -80,8 +85,8 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
             ptx::red_add(counter_ptr, 1);
             const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
             wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
-                printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                       sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                printf("DeepGEMM NVLink barrier timeout (%ds): rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                       DG_BARRIER_TIMEOUT_SECONDS, sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
             });
         }
     }

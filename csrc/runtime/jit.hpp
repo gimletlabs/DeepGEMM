@@ -6,6 +6,7 @@
 
 #include <cutlass/version.h>
 #include <deep_jit/backend/cuda/backend.hpp>
+#include <deep_jit/utils/env.hpp>
 
 namespace deep_gemm {
 
@@ -27,6 +28,10 @@ inline void init_jit(const std::string& library_root_path) {
             emplace_back("--diag-suppress=39,161,174,177,186,940");
         runtime->default_compiler_options.nvcc_flags->
             emplace_back("--compiler-options=-Wno-deprecated-declarations,-Wno-abi");
+        // Compiler flags enter the JIT cache key, so each timeout gets its own kernels.
+        if (const auto timeout = deep_jit::get_env<int>("DG_JIT_BARRIER_TIMEOUT_SECONDS", 0); timeout > 0)
+            runtime->default_compiler_options.nvcc_flags->
+                emplace_back("-DDG_BARRIER_TIMEOUT_SECONDS=" + std::to_string(timeout));
         return runtime;
     });
 }
