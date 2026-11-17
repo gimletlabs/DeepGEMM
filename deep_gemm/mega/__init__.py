@@ -73,7 +73,7 @@ class SymmBuffer:
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf, self.x_scales) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -175,7 +175,16 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     use_x_scales: bool = False,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     l2_act_scales: Optional[torch.Tensor] = None,
+                     post_expert_norm: bool = False,
+                     post_expert_norm_weight: Optional[torch.Tensor] = None,
+                     post_expert_norm_eps: float = 1e-6,
+                     post_expert_norm_weight_first: bool = False,
+                     use_trtllm_weights: bool = False):
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -185,9 +194,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
+        recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math
+        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
+        post_expert_norm, post_expert_norm_weight, post_expert_norm_eps,
+        post_expert_norm_weight_first, use_trtllm_weights
     )
 
 def bf16_mega_moe(y: torch.Tensor,
@@ -199,7 +210,12 @@ def bf16_mega_moe(y: torch.Tensor,
                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
-                  fast_math: bool = True):
+                  fast_math: bool = True,
+                  post_expert_norm: bool = False,
+                  post_expert_norm_weight: Optional[torch.Tensor] = None,
+                  post_expert_norm_eps: float = 1e-6,
+                  post_expert_norm_weight_first: bool = False,
+                  use_trtllm_weights: bool = False):
     _C.bf16_mega_moe(
         y,
         l1_weights,
@@ -214,5 +230,6 @@ def bf16_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts,
         sym_buffer.num_topk,
         activation, activation_clamp,
-        fast_math
+        fast_math, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps,
+        post_expert_norm_weight_first, use_trtllm_weights
     )

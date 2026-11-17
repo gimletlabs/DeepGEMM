@@ -1,7 +1,7 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
@@ -12,6 +12,62 @@
 #include "runtime_utils.hpp"
 
 namespace deep_gemm {
+
+// Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
+static CUtensorMap make_trtllm_fp4_l2_tma_desc(
+    const torch::Tensor& weights, const int inner_bytes, const int rows) {
+    DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
+    DG_HOST_ASSERT(inner_bytes % 128 == 0);
+    CUtensorMap result;
+    const cuuint64_t dims[4] = {static_cast<cuuint64_t>(inner_bytes), 4, 8,
+                                static_cast<cuuint64_t>(rows / 32)};
+    const cuuint64_t strides[3] = {8ull * inner_bytes,
+                                   static_cast<cuuint64_t>(inner_bytes), 32ull * inner_bytes};
+    const cuuint32_t box[4] = {128, 4, 8, 4};
+    const cuuint32_t element_strides[4] = {1, 1, 1, 1};
+    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+        &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.data_ptr(), dims,
+        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return result;
+}
+
+// TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
+static CUtensorMap make_trtllm_fp4_sf_tma_desc(
+    const torch::Tensor& sf, const bool& is_l1,
+    const int& num_row_blocks, const int& num_k_chunks,
+    const int& box_k_chunks, const int& box_row_blocks) {
+    DG_HOST_ASSERT(num_row_blocks > 0 and num_k_chunks > 0);
+    DG_HOST_ASSERT(box_k_chunks <= num_k_chunks and box_row_blocks <= num_row_blocks);
+    CUtensorMap result;
+    const auto row_block_stride = static_cast<cuuint64_t>(num_k_chunks) * 512ull;
+    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
+    if (is_l1) {
+        const cuuint64_t dims[3] = {128, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[2] = {512ull, row_block_stride};
+        const cuuint32_t box[3] = {128, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 3, sf.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    } else {
+        const cuuint64_t dims[5] = {4, 4, 8, static_cast<cuuint64_t>(num_k_chunks),
+                                    static_cast<cuuint64_t>(num_row_blocks)};
+        const cuuint64_t strides[4] = {128ull, 16ull, 512ull, row_block_stride};
+        const cuuint32_t box[5] = {4, 4, 8, static_cast<cuuint32_t>(box_k_chunks),
+                                   static_cast<cuuint32_t>(box_row_blocks)};
+        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
+            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.data_ptr(), dims,
+            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    }
+    return result;
+}
 
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
@@ -32,7 +88,17 @@ static void sm100_fp8_fp4_mega_moe(
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_x_scales,
+    const float* l1_alphas,
+    const float* l2_alphas,
+    const float* l2_act_scales,
+    const float* post_expert_norm_weight,
+    const bool& with_post_expert_norm,
+    const bool& post_norm_weight_first,
+    const float& post_norm_eps,
+    const MmaKind& mma_kind,
+    const bool& use_trtllm_weights = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -45,14 +111,25 @@ static void sm100_fp8_fp4_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
         num_ring_tokens, num_sf_ring_tokens,
-        MmaKind::MXFP8FP4);
+        mma_kind);
+
+    if (use_trtllm_weights) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4 and num_shared_experts == 0);
+        DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
+    }
 
     // Make tensormap
-    constexpr int kGranK = 32;
+    const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
+    const int kGranK = config.gran_k;
+    const int elem_bits = get_element_bits(mma_kind);
+    const auto to_inner = [=](const int& num_elems) { return num_elems * elem_bits / 8; };
+    const auto weight_tensor = [=](const torch::Tensor& t) { return is_packed_fp4 ? t.view(torch::kUInt8) : t; };
+    const auto weight_inner = [=](const int& num_elems) { return is_packed_fp4 ? num_elems / 2 : num_elems; };
+    const int block_k_inner = to_inner(config.block_k);
     const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, config.num_ring_tokens,
-                                                     config.block_k, config.load_block_m,
+                                                     to_inner(hidden), config.num_ring_tokens,
+                                                     block_k_inner, config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
@@ -60,8 +137,15 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
-    const auto tensor_map_l1_weights = make_tma_weights_3d_desc(l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode);
-    const auto tensor_map_l1_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
+    const auto tensor_map_l1_weights = not is_packed_fp4 ? make_tma_weights_3d_desc(l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : make_tma_2d_desc(weight_tensor(l1_weights),
+                                                        weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
+                                                        block_k_inner, config.load_block_n,
+                                                        static_cast<int>(l1_weights.stride(-2)),
+                                                        config.swizzle_weights_mode, 0, false, not is_packed_fp4);
+    const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
+        hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
                                                            intermediate_hidden * 2, hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -69,14 +153,15 @@ static void sm100_fp8_fp4_mega_moe(
     // NOTES: L1 output and L2 activations are essentially the same tensor.
     // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
     // so the swizzle mode is also halved (128 -> 64).
+    const int l1_out_block_n_bytes = to_inner(config.block_n / 2);
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
-                                                       intermediate_hidden, config.num_ring_tokens,
-                                                       config.block_n / 2, config.store_block_m_l1,
+                                                       to_inner(intermediate_hidden), config.num_ring_tokens,
+                                                       l1_out_block_n_bytes, config.store_block_m_l1,
                                                        static_cast<int>(l2_acts.stride(-2)),
-                                                       config.swizzle_acts_mode / 2);
+                                                       l1_out_block_n_bytes);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
-                                                     intermediate_hidden, config.num_ring_tokens,
-                                                     config.block_k, config.load_block_m,
+                                                     to_inner(intermediate_hidden), config.num_ring_tokens,
+                                                     block_k_inner, config.load_block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
@@ -84,8 +169,17 @@ static void sm100_fp8_fp4_mega_moe(
                                                         config.sf_block_m, kGranK,
                                                         1, 0, 0, false,
                                                         sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = make_tma_weights_3d_desc(l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode);
-    const auto tensor_map_l2_weights_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
+    const auto tensor_map_l2_weights = not is_packed_fp4 ? make_tma_weights_3d_desc(l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
+        l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
+        make_tma_2d_desc(weight_tensor(l2_weights),
+                                                        weight_inner(intermediate_hidden), num_experts_per_rank * hidden,
+                                                        block_k_inner, config.load_block_n,
+                                                        static_cast<int>(l2_weights.stride(-2)),
+                                                        config.swizzle_weights_mode, 0, false, not is_packed_fp4);
+    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
+        l2_weights_sf, false, num_experts_per_rank * hidden / 128,
+        intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
                                                            hidden, intermediate_hidden,
                                                            config.block_n, kGranK,
                                                            num_experts_per_rank, 0, 0, false,
@@ -93,8 +187,8 @@ static void sm100_fp8_fp4_mega_moe(
 
     const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l1_acts,
-        hidden, num_max_tokens_per_rank,
-        config.block_k, config.load_block_m,
+        to_inner(hidden), num_max_tokens_per_rank,
+        block_k_inner, config.load_block_m,
         static_cast<int>(shared_l1_acts.stride(-2)),
         config.swizzle_acts_mode) : tensor_map_l1_acts;
     const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
@@ -113,14 +207,14 @@ static void sm100_fp8_fp4_mega_moe(
         sf_smem_outer_dim, static_cast<int>(shared_l1_weights_sf.stride(-1))) : tensor_map_l1_weights_sf;
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
-        shared_intermediate_hidden, num_max_tokens_per_rank,
-        config.block_n / 2, config.store_block_m_l1,
+        to_inner(shared_intermediate_hidden), num_max_tokens_per_rank,
+        l1_out_block_n_bytes, config.store_block_m_l1,
         static_cast<int>(shared_l2_acts.stride(-2)),
-        config.swizzle_acts_mode / 2) : tensor_map_l1_output;
+        l1_out_block_n_bytes) : tensor_map_l1_output;
     const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
         shared_l2_acts,
-        shared_intermediate_hidden, num_max_tokens_per_rank,
-        config.block_k, config.load_block_m,
+        to_inner(shared_intermediate_hidden), num_max_tokens_per_rank,
+        block_k_inner, config.load_block_m,
         static_cast<int>(shared_l2_acts.stride(-2)),
         config.swizzle_acts_mode) : tensor_map_l2_acts;
     const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
@@ -164,30 +258,41 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {},
         {}, {},
         {},
         {},
-        {}
+        {}, {}, {}, {}, {},
+        {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
-        hidden, intermediate_hidden,
-        num_experts, num_shared_experts,
-        num_topk,
-        config.block_m, config.block_n, config.block_k,
-        config.store_block_m_l1, config.store_block_m_l2,
-        config.sf_block_m, config.sf_block_n,
-        config.num_ring_tokens,
-        config.num_sf_ring_tokens,
-        config.num_stages,
-        config.num_bytes_per_pull,
-        config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
-        num_sms, num_ranks,
-        to_string(activation_clamp),
-        fast_math ? "true" : "false",
-        to_string(l1_weights.scalar_type())));
-
+    hidden, intermediate_hidden,
+    num_experts, num_shared_experts,
+    num_topk,
+    config.block_m, config.block_n, config.block_k,
+    config.store_block_m_l1, config.store_block_m_l2,
+    config.sf_block_m, config.sf_block_n,
+    to_mma_kind_name(mma_kind),
+    config.num_ring_tokens,
+    config.num_sf_ring_tokens,
+    config.num_stages,
+    config.num_bytes_per_pull,
+    config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
+    num_sms, num_ranks,
+    to_string(activation_clamp),
+    fast_math ? "true" : "false",
+    use_x_scales ? "true" : "false",
+    (l1_alphas != nullptr) ? "true" : "false",
+    (l2_alphas != nullptr) ? "true" : "false",
+    (l2_act_scales != nullptr) ? "true" : "false",
+    to_string(l1_weights.scalar_type()),
+    with_post_expert_norm ? "true" : "false",
+    post_norm_weight_first ? "true" : "false",
+    post_expert_norm_weight != nullptr ? "true" : "false",
+    to_string(post_norm_eps),
+    use_trtllm_weights ? "true" : "false"));
     // Launch
     jit->launch(
         kernel, {
@@ -198,6 +303,8 @@ static void __instantiate_kernel() {{
         },
         y.data_ptr(),
         cumulative_local_expert_recv_stats_ptr,
+        l1_alphas, l2_alphas, l2_act_scales,
+        post_expert_norm_weight,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         tensor_map_l1_acts,
