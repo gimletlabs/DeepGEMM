@@ -6,7 +6,10 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cublasLt.h>
+#include <torch/torch.h>
+#ifndef DG_NO_PYTHON
 #include <torch/python.h>
+#endif
 
 #include <deep_jit/utils/env.hpp>
 #include <deep_jit/utils/lazy.hpp>

@@ -3,7 +3,10 @@
 #include <c10/util/accumulate.h>
 #include <c10/util/strides.h>
 #include <cute/arch/mma_sm100_umma.hpp>
+#include <torch/torch.h>
+#ifndef DG_NO_PYTHON
 #include <torch/python.h>
+#endif
 
 #include <deep_gemm/common/types.cuh>
 

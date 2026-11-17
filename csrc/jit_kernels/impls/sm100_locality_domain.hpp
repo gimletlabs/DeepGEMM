@@ -1,7 +1,7 @@
 #pragma once
 
 #include <format>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include "../../runtime/runtime.hpp"
 #include "../heuristics/sm100.hpp"

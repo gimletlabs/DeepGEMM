@@ -1,15 +1,26 @@
 #pragma once
 
 #include <unistd.h>
+#include <stdexcept>
 
 #include <cuda.h>
+#ifndef DG_NO_PYTHON
 #include <pybind11/pybind11.h>
+#endif
 #include <deep_jit/backend/cuda/driver.hpp>
 
 #include "jit.hpp"
 
 namespace deep_gemm::mlopart {
 
+#ifdef DG_NO_PYTHON
+// The native runtime uses existing CUDA allocations, without Python MLOPart IPC.
+static bool is_available() { return false; }
+static CUmemGenericAllocationHandle create_memory(const size_t&, const int&) {
+    throw std::runtime_error("MLOPart allocation requires Python support");
+}
+static void release() {}
+#else
 // We have to use IPC to allocate localized memory via MLOPart prior to CUDA 13.4
 // For convenience this is done in Python
 static pybind11::module_ get_module() {
@@ -37,5 +48,7 @@ static CUmemGenericAllocationHandle create_memory(const size_t& num_bytes, const
 static void release() {
     get_module().attr("release")();
 }
+
+#endif
 
 }  // namespace deep_gemm::mlopart

@@ -2,7 +2,10 @@
 
 #include <c10/util/accumulate.h>
 #include <c10/util/strides.h>
+#include <torch/torch.h>
+#ifndef DG_NO_PYTHON
 #include <torch/python.h>
+#endif
 
 #include "../jit_kernels/impls/sm100_locality_domain.hpp"
 #include "../runtime/runtime.hpp"
@@ -113,7 +116,9 @@ static torch::Tensor probe_sm_locality_domains() {
         if (const auto sm_domain = try_probe_sm_locality_domains(buf); sm_domain.defined())
             return sm_domain;
     }
+#ifndef DG_NO_PYTHON
     pybind11::module_::import("warnings").attr("warn")("The SM locality domain probe found no stable mapping; using an even one");
+#endif
     return get_even_sm_locality_domains();
 }
 
@@ -146,6 +151,7 @@ static void release_mlopart() {
     mlopart::release();
 }
 
+#ifndef DG_NO_PYTHON
 static void register_apis(pybind11::module_& m) {
     auto submodule = m.def_submodule("locality_domain", "Memory homed in the GPU's locality domains");
     submodule.def("get_num_locality_domains", &get_num_locality_domains);
@@ -158,5 +164,7 @@ static void register_apis(pybind11::module_& m) {
     submodule.def("get_balanced_sm_locality_domains", &get_balanced_sm_locality_domains);
     submodule.def("release_mlopart", &release_mlopart);
 }
+
+#endif
 
 }  // namespace deep_gemm::locality_domain

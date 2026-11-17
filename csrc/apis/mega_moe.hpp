@@ -3,7 +3,9 @@
 #include <functional>
 #include <string>
 #include <torch/torch.h>
+#ifndef DG_NO_PYTHON
 #include <pybind11/functional.h>
+#endif
 
 #include "../utils/exception.hpp"
 
@@ -529,6 +531,7 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
+#ifndef DG_NO_PYTHON
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe,
@@ -552,5 +555,7 @@ static void register_apis(pybind11::module_& m) {
           pybind11::arg("buf_x_scales") = std::nullopt,
           pybind11::arg("expert_scales") = std::nullopt);
 }
+
+#endif
 
 } // namespace deep_gemm::mega

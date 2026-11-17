@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../runtime/runtime.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,7 +10,7 @@
 #include <utility>
 
 #include <cuda.h>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include <deep_jit/backend/cuda/driver.hpp>
 #include <deep_jit/utils/env.hpp>
