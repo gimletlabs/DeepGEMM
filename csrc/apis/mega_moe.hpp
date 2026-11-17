@@ -53,36 +53,11 @@ get_symm_buffer_size_for_mega_moe(
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
     const auto num_sms = get_num_sms_for_mega_moe();
-    const auto num_experts_per_rank = num_experts / num_ranks;
-    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
-    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
-
-    // Shared
     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-
-    // Iterate all block candidates to get the maximum ring size
-    int num_ring_tokens = 0;
-    for (const auto& block_m: layout::kCandidateBlockM) {
-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
-    }
-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
-
-
-    // Parse MMA type
     const auto with_sf = is_mma_with_sf(mma_kind);
-
-    // Compute num_sf_ring_tokens (max across all candidate block sizes)
-    int num_sf_ring_tokens = 0;
-    if (with_sf) {
-        for (auto block_m: layout::kCandidateBlockM) {
-            num_sf_ring_tokens = std::max(
-                num_sf_ring_tokens,
-                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
-        }
-    }
+    const auto [num_ring_tokens, num_sf_ring_tokens] = get_ring_sizes_for_mega_moe(
+        num_sms, num_ranks, num_experts, num_max_tokens_per_rank,
+        num_topk, hidden, intermediate_hidden, mma_kind);
 
     // All buffers
     const auto mega_buffer = layout::MegaMoEBuffer(
