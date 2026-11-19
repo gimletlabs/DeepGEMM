@@ -224,7 +224,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kNumEpilogueStages = 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
     // Prefetch so the TMEM stage is released earlier, keeping the epilogue off the critical path
-    constexpr uint32_t kNumEpiPrefetchStages = BLOCK_M == 240 ? 1 : 0;
+    // Muse's post-expert norm with TRT-layout weights is faster without accumulator prefetch.
+    constexpr bool kHasMusePostExpertNorm = kWithPostExpertNorm and kUseTrtllmWeights;
+    constexpr uint32_t kNumEpiPrefetchStages =
+        BLOCK_M == 240 and not kHasMusePostExpertNorm ? 1 : 0;
     constexpr uint32_t ATOM_M = 8;
 
     // Shared memory
