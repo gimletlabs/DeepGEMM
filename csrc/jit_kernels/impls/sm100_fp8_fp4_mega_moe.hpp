@@ -9,65 +9,9 @@
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../heuristics/mega_moe.hpp"
-#include "runtime_utils.hpp"
+#include "mega_moe_runtime_utils.hpp"
 
 namespace deep_gemm {
-
-// Undo TRT's L2 shuffle: GMEM row 32*i3 + 8*i1 + i2 -> SMEM row 32*i3 + 4*i2 + i1.
-static CUtensorMap make_trtllm_fp4_l2_tma_desc(
-    const torch::Tensor& weights, const int inner_bytes, const int rows) {
-    DG_HOST_ASSERT(weights.is_contiguous() and rows % 128 == 0);
-    DG_HOST_ASSERT(inner_bytes % 128 == 0);
-    CUtensorMap result;
-    const cuuint64_t dims[4] = {static_cast<cuuint64_t>(inner_bytes), 4, 8,
-                                static_cast<cuuint64_t>(rows / 32)};
-    const cuuint64_t strides[3] = {8ull * inner_bytes,
-                                   static_cast<cuuint64_t>(inner_bytes), 32ull * inner_bytes};
-    const cuuint32_t box[4] = {128, 4, 8, 4};
-    const cuuint32_t element_strides[4] = {1, 1, 1, 1};
-    DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
-        &result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, weights.data_ptr(), dims,
-        strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    return result;
-}
-
-// TRT SFs: [row block][k chunk][128 words]. L2 also undoes the 32-row shuffle.
-static CUtensorMap make_trtllm_fp4_sf_tma_desc(
-    const torch::Tensor& sf, const bool& is_l1,
-    const int& num_row_blocks, const int& num_k_chunks,
-    const int& box_k_chunks, const int& box_row_blocks) {
-    DG_HOST_ASSERT(num_row_blocks > 0 and num_k_chunks > 0);
-    DG_HOST_ASSERT(box_k_chunks <= num_k_chunks and box_row_blocks <= num_row_blocks);
-    CUtensorMap result;
-    const auto row_block_stride = static_cast<cuuint64_t>(num_k_chunks) * 512ull;
-    const cuuint32_t element_strides[5] = {1, 1, 1, 1, 1};
-    if (is_l1) {
-        const cuuint64_t dims[3] = {128, static_cast<cuuint64_t>(num_k_chunks),
-                                    static_cast<cuuint64_t>(num_row_blocks)};
-        const cuuint64_t strides[2] = {512ull, row_block_stride};
-        const cuuint32_t box[3] = {128, static_cast<cuuint32_t>(box_k_chunks),
-                                   static_cast<cuuint32_t>(box_row_blocks)};
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
-            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 3, sf.data_ptr(), dims,
-            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    } else {
-        const cuuint64_t dims[5] = {4, 4, 8, static_cast<cuuint64_t>(num_k_chunks),
-                                    static_cast<cuuint64_t>(num_row_blocks)};
-        const cuuint64_t strides[4] = {128ull, 16ull, 512ull, row_block_stride};
-        const cuuint32_t box[5] = {4, 4, 8, static_cast<cuuint32_t>(box_k_chunks),
-                                   static_cast<cuuint32_t>(box_row_blocks)};
-        DJ_CUDA_DRIVER_CHECK(deep_jit::cuda::driver::lazy_cuTensorMapEncodeTiled(
-            &result, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, sf.data_ptr(), dims,
-            strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
-    }
-    return result;
-}
 
 static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& y,
@@ -104,7 +48,6 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
-    const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
 
     // Heuristics
     const auto config = get_mega_moe_config(
@@ -118,119 +61,31 @@ static void sm100_fp8_fp4_mega_moe(
         DG_HOST_ASSERT(config.block_n % 128 == 0 and config.block_k % (config.gran_k * 4) == 0);
     }
 
-    // Make tensormap
-    const bool is_packed_fp4 = mma_kind == MmaKind::NVFP4 or mma_kind == MmaKind::MXFP4;
-    const int kGranK = config.gran_k;
-    const int elem_bits = get_element_bits(mma_kind);
-    const auto to_inner = [=](const int& num_elems) { return num_elems * elem_bits / 8; };
-    const auto weight_tensor = [=](const torch::Tensor& t) { return is_packed_fp4 ? t.view(torch::kUInt8) : t; };
-    const auto weight_inner = [=](const int& num_elems) { return is_packed_fp4 ? num_elems / 2 : num_elems; };
-    const int block_k_inner = to_inner(config.block_k);
-    const int sf_smem_outer_dim = config.block_k / (kGranK * 4);
-    const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     to_inner(hidden), config.num_ring_tokens,
-                                                     block_k_inner, config.load_block_m,
-                                                     static_cast<int>(l1_acts.stride(-2)),
-                                                     config.swizzle_acts_mode);
-    const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                                                        config.num_sf_ring_tokens, hidden,
-                                                        config.sf_block_m, kGranK,
-                                                        1, 0, 0, false,
-                                                        sf_smem_outer_dim, static_cast<int>(l1_acts_sf.stride(-1)));
-    const auto tensor_map_l1_weights = not is_packed_fp4 ? make_tma_weights_3d_desc(l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : make_tma_2d_desc(weight_tensor(l1_weights),
-                                                        weight_inner(hidden), num_experts_per_rank * intermediate_hidden * 2,
-                                                        block_k_inner, config.load_block_n,
-                                                        static_cast<int>(l1_weights.stride(-2)),
-                                                        config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l1_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
-        l1_weights_sf, true, num_experts_per_rank * intermediate_hidden * 2 / 128,
-        hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
-        make_tma_sf_desc(cute::UMMA::Major::MN, l1_weights_sf,
-                                                           intermediate_hidden * 2, hidden,
-                                                           config.block_n, kGranK,
-                                                           num_experts_per_rank, 0, 0, false,
-                                                           sf_smem_outer_dim, static_cast<int>(l1_weights_sf.stride(-1)));
-    // NOTES: L1 output and L2 activations are essentially the same tensor.
-    // Post-SwiGLU output has half the N width (`BLOCK_N / 2` per input tile),
-    // so the swizzle mode is also halved (128 -> 64).
-    const int l1_out_block_n_bytes = to_inner(config.block_n / 2);
-    const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
-                                                       to_inner(intermediate_hidden), config.num_ring_tokens,
-                                                       l1_out_block_n_bytes, config.store_block_m_l1,
-                                                       static_cast<int>(l2_acts.stride(-2)),
-                                                       l1_out_block_n_bytes);
-    const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
-                                                     to_inner(intermediate_hidden), config.num_ring_tokens,
-                                                     block_k_inner, config.load_block_m,
-                                                     static_cast<int>(l2_acts.stride(-2)),
-                                                     config.swizzle_acts_mode);
-    const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        config.num_sf_ring_tokens, intermediate_hidden,
-                                                        config.sf_block_m, kGranK,
-                                                        1, 0, 0, false,
-                                                        sf_smem_outer_dim, static_cast<int>(l2_acts_sf.stride(-1)));
-    const auto tensor_map_l2_weights = not is_packed_fp4 ? make_tma_weights_3d_desc(l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : use_trtllm_weights ? make_trtllm_fp4_l2_tma_desc(
-        l2_weights, weight_inner(intermediate_hidden), num_experts_per_rank * hidden) :
-        make_tma_2d_desc(weight_tensor(l2_weights),
-                                                        weight_inner(intermediate_hidden), num_experts_per_rank * hidden,
-                                                        block_k_inner, config.load_block_n,
-                                                        static_cast<int>(l2_weights.stride(-2)),
-                                                        config.swizzle_weights_mode, 0, false, not is_packed_fp4);
-    const auto tensor_map_l2_weights_sf = use_trtllm_weights ? make_trtllm_fp4_sf_tma_desc(
-        l2_weights_sf, false, num_experts_per_rank * hidden / 128,
-        intermediate_hidden / (kGranK * 4), sf_smem_outer_dim, config.block_n / 128) :
-        make_tma_sf_desc(cute::UMMA::Major::MN, l2_weights_sf,
-                                                           hidden, intermediate_hidden,
-                                                           config.block_n, kGranK,
-                                                           num_experts_per_rank, 0, 0, false,
-                                                           sf_smem_outer_dim, static_cast<int>(l2_weights_sf.stride(-1)));
-
-    const auto tensor_map_shared_l1_acts = num_shared_experts > 0 ? make_tma_2d_desc(
-        shared_l1_acts,
-        to_inner(hidden), num_max_tokens_per_rank,
-        block_k_inner, config.load_block_m,
-        static_cast<int>(shared_l1_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l1_acts;
-    const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
-        cute::UMMA::Major::MN, shared_l1_acts_sf,
-        static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
-        config.sf_block_m, kGranK,
-        1, 0, 0, false,
-        sf_smem_outer_dim, static_cast<int>(shared_l1_acts_sf.stride(-1))) : tensor_map_l1_acts_sf;
-    const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(shared_l1_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l1_weights;
-    const auto tensor_map_shared_l1_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
-        cute::UMMA::Major::MN, shared_l1_weights_sf,
-        shared_intermediate_hidden * 2, hidden,
-        config.block_n, kGranK,
-        1, 0, 0, false,
-        sf_smem_outer_dim, static_cast<int>(shared_l1_weights_sf.stride(-1))) : tensor_map_l1_weights_sf;
-    const auto tensor_map_shared_l1_output = num_shared_experts > 0 ? make_tma_2d_desc(
-        shared_l2_acts,
-        to_inner(shared_intermediate_hidden), num_max_tokens_per_rank,
-        l1_out_block_n_bytes, config.store_block_m_l1,
-        static_cast<int>(shared_l2_acts.stride(-2)),
-        l1_out_block_n_bytes) : tensor_map_l1_output;
-    const auto tensor_map_shared_l2_acts = num_shared_experts > 0 ? make_tma_2d_desc(
-        shared_l2_acts,
-        to_inner(shared_intermediate_hidden), num_max_tokens_per_rank,
-        block_k_inner, config.load_block_m,
-        static_cast<int>(shared_l2_acts.stride(-2)),
-        config.swizzle_acts_mode) : tensor_map_l2_acts;
-    const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ? make_tma_sf_desc(
-        cute::UMMA::Major::MN, shared_l2_acts_sf,
-        static_cast<int>(shared_l2_acts_sf.size(0)), shared_intermediate_hidden,
-        config.sf_block_m, kGranK,
-        1, 0, 0, false,
-        sf_smem_outer_dim, static_cast<int>(shared_l2_acts_sf.stride(-1))) : tensor_map_l2_acts_sf;
-    const auto tensor_map_shared_l2_weights = num_shared_experts > 0 ?
-        make_tma_weights_2d_desc(shared_l2_weights, config.block_k, config.load_block_n, config.swizzle_weights_mode) : tensor_map_l2_weights;
-    const auto tensor_map_shared_l2_weights_sf = num_shared_experts > 0 ? make_tma_sf_desc(
-        cute::UMMA::Major::MN, shared_l2_weights_sf,
-        hidden, shared_intermediate_hidden,
-        config.block_n, kGranK,
-        1, 0, 0, false,
-        sf_smem_outer_dim, static_cast<int>(shared_l2_weights_sf.stride(-1))) : tensor_map_l2_weights_sf;
+    const auto maps = mega_moe_tensor_map_builder().make_fp4_mega_moe_maps(
+        config,
+        mega_moe_tensor_view(l1_acts),
+        mega_moe_tensor_view(l1_acts_sf),
+        mega_moe_tensor_view(l1_weights),
+        mega_moe_tensor_view(l1_weights_sf),
+        mega_moe_tensor_view(l2_acts),
+        mega_moe_tensor_view(l2_acts_sf),
+        mega_moe_tensor_view(l2_weights),
+        mega_moe_tensor_view(l2_weights_sf),
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l1_acts) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l1_acts_sf) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l1_weights) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l1_weights_sf) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l2_acts) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l2_acts_sf) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l2_weights) : host::TensorView{},
+        num_shared_experts > 0 ? mega_moe_tensor_view(shared_l2_weights_sf) : host::TensorView{},
+        hidden,
+        intermediate_hidden,
+        num_experts_per_rank,
+        num_shared_experts,
+        num_max_tokens_per_rank,
+        use_trtllm_weights,
+        mma_kind);
 
     // Stats can be optional
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
@@ -293,39 +148,19 @@ static void __instantiate_kernel() {{
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
     use_trtllm_weights ? "true" : "false"));
-    // Launch
-    jit->launch(
-        kernel, {
-            .num_smem_bytes = config.smem_size,
-            .grid_dim = dim3(num_sms, 1, 1),
-            .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),
-            .cluster_dim = dim3(2, 1, 1),
-        },
-        y.data_ptr(),
-        cumulative_local_expert_recv_stats_ptr,
-        l1_alphas, l2_alphas, l2_act_scales,
-        post_expert_norm_weight,
-        num_tokens,
-        layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
-        tensor_map_l1_acts,
-        tensor_map_l1_acts_sf,
-        tensor_map_l1_weights,
-        tensor_map_l1_weights_sf,
-        tensor_map_l1_output,
-        tensor_map_l2_acts,
-        tensor_map_l2_acts_sf,
-        tensor_map_l2_weights,
-        tensor_map_l2_weights_sf,
-        tensor_map_shared_l1_acts,
-        tensor_map_shared_l1_acts_sf,
-        tensor_map_shared_l1_weights,
-        tensor_map_shared_l1_weights_sf,
-        tensor_map_shared_l1_output,
-        tensor_map_shared_l2_acts,
-        tensor_map_shared_l2_acts_sf,
-        tensor_map_shared_l2_weights,
-        tensor_map_shared_l2_weights_sf,
-        sm_locality_domains.data_ptr<uint8_t>());
+    host::with_fp4_mega_moe_args(
+        [&](const auto&... args) {
+            jit->launch(
+                kernel, {
+                    .num_smem_bytes = config.smem_size,
+                    .grid_dim = dim3(num_sms, 1, 1),
+                    .block_dim = dim3(config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads, 1, 1),
+                    .cluster_dim = dim3(2, 1, 1),
+                },
+                args...);
+        }, maps, layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        y.data_ptr(), cumulative_local_expert_recv_stats_ptr, num_tokens,
+        sm_locality_domains.data_ptr<uint8_t>(), post_expert_norm_weight, l1_alphas, l2_alphas, l2_act_scales);
 }
 
 } // namespace deep_gemm

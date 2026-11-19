@@ -3,6 +3,7 @@
 #include <torch/torch.h>
 
 #include <optional>
+#include <deep_gemm/host/mega_moe.cuh>
 
 #include "../heuristics/mega_moe.hpp"
 #include "../../utils/exception.hpp"
@@ -22,21 +23,7 @@ public:
         MmaKind mma_kind;
         bool use_pdl;
 
-        // Runtime args (passed to the kernel via the params struct).
-        const void* x;
-        const void* topk_idx;
-        const void* topk_weights;
-        const void* expert_scales;
-        void*       buf_x;
-        void*       buf_x_sf;
-        void*       buf_x_scales;
-        void*       buf_topk_idx;
-        void*       buf_topk_weights;
-        uint32_t    num_tokens;
-        uint32_t    padded_max;
-        uint32_t    hidden;
-        uint32_t    num_groups;
-        uint32_t    top_k;
+        host::MegaMoEPreDispatchArgs runtime;
 
         deep_jit::cuda::LaunchOptions launch_args;
     };
@@ -58,11 +45,9 @@ static void __instantiate_kernel() {{
     }
 
     static void launch(const std::shared_ptr<deep_jit::cuda::Kernel>& kernel, const Args& args) {
-        jit->launch(kernel, args.launch_args,
-            args.x, args.topk_idx, args.topk_weights, args.expert_scales,
-            args.buf_x, args.buf_x_sf, args.buf_x_scales,
-            args.buf_topk_idx, args.buf_topk_weights,
-            args.num_tokens, args.padded_max, args.hidden, args.num_groups, args.top_k);
+        host::with_mega_moe_pre_dispatch_args([&](const auto&... values) {
+            jit->launch(kernel, args.launch_args, values...);
+        }, args.runtime);
     }
 };
 
@@ -175,22 +160,24 @@ static void mega_moe_pre_dispatch(
         .group_size = group_size,
         .mma_kind = mma_kind,
         .use_pdl = use_pdl,
-        .x = x.const_data_ptr(),
-        .topk_idx = topk_idx.const_data_ptr(),
-        .topk_weights = topk_weights.const_data_ptr(),
-        .expert_scales = expert_scales.has_value()
-            ? expert_scales->const_data_ptr() : nullptr,
-        .buf_x = buf_x.data_ptr(),
-        .buf_x_sf = buf_x_sf.data_ptr(),
-        .buf_x_scales = buf_x_scales.has_value()
-            ? buf_x_scales->data_ptr() : nullptr,
-        .buf_topk_idx = buf_topk_idx.data_ptr(),
-        .buf_topk_weights = buf_topk_weights.data_ptr(),
-        .num_tokens = static_cast<uint32_t>(num_tokens),
-        .padded_max = static_cast<uint32_t>(padded_max),
-        .hidden = static_cast<uint32_t>(hidden),
-        .num_groups = static_cast<uint32_t>(num_groups),
-        .top_k = static_cast<uint32_t>(top_k),
+        .runtime = {
+            .x = x.const_data_ptr(),
+            .topk_idx = topk_idx.const_data_ptr(),
+            .topk_weights = topk_weights.const_data_ptr(),
+            .expert_scales = expert_scales.has_value()
+                ? expert_scales->const_data_ptr() : nullptr,
+            .buf_x = buf_x.data_ptr(),
+            .buf_x_sf = buf_x_sf.data_ptr(),
+            .buf_x_scales = buf_x_scales.has_value()
+                ? buf_x_scales->data_ptr() : nullptr,
+            .buf_topk_idx = buf_topk_idx.data_ptr(),
+            .buf_topk_weights = buf_topk_weights.data_ptr(),
+            .num_tokens = static_cast<uint32_t>(num_tokens),
+            .padded_max = static_cast<uint32_t>(padded_max),
+            .hidden = static_cast<uint32_t>(hidden),
+            .num_groups = static_cast<uint32_t>(num_groups),
+            .top_k = static_cast<uint32_t>(top_k),
+        },
         .launch_args = make_launch_options(num_total_blocks, num_threads, /*smem_size=*/0,
                                   /*cluster_dim=*/1, /*enable_pdl=*/use_pdl)
     };
