@@ -93,13 +93,11 @@ CUTLASS_DEVICE uint32_t mqa_logits_metadata_upper_bound(const uint32_t* prefix, 
 }
 
 // Build KV spans, work/cost prefix sums and per-SM starts in one CTA
-template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs,
-          uint32_t kSegmentCost, uint32_t kSplitCost, uint32_t kNumThreads>
-CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1)
-void sm100_mqa_logits_metadata(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
-                               const uint32_t* cu_seq_len_k_start,
-                               const uint32_t* cu_seq_len_k_end,
-                               uint32_t* schedule_meta) {
+template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kSegmentCost, uint32_t kSplitCost, uint32_t kNumThreads>
+CUTLASS_DEVICE void sm100_mqa_logits_metadata_impl(const uint32_t num_sms,
+                                                   const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
+                                                   const uint32_t* cu_seq_len_k_start,
+                                                   const uint32_t* cu_seq_len_k_end, uint32_t* schedule_meta) {
     DG_STATIC_ASSERT(kNumThreads > 0 and kNumThreads <= 1024 and kNumThreads % 32 == 0, "Invalid thread count");
     DG_STATIC_ASSERT(kSegmentCost > 0 and kSplitCost > 0, "Invalid costs");
     constexpr uint32_t kNumWarps = kNumThreads / 32;
@@ -116,7 +114,7 @@ void sm100_mqa_logits_metadata(const uint32_t num_q_tokens, const uint32_t num_k
     const auto cost_prefix = work_prefix + num_q_blocks;        // [num_q_blocks]
     const auto warp_sums = cost_prefix + num_q_blocks;          // [kNumWarps]
     const auto kv_spans = reinterpret_cast<MQALogitsKVSpan*>(
-        schedule_meta + get_mqa_logits_metadata_span_word_offset(kNumSMs));
+        schedule_meta + get_mqa_logits_metadata_span_word_offset(num_sms));
 
     // Per-block spans, work and cost
     for (uint32_t q_block_idx = thread_idx; q_block_idx < num_q_blocks; q_block_idx += kNumThreads) {
@@ -139,8 +137,8 @@ void sm100_mqa_logits_metadata(const uint32_t num_q_tokens, const uint32_t num_k
 
         CUTLASS_DEVICE Boundary(const uint2& start, const uint32_t& work_offset): start(start), work_offset(work_offset) {}
     };
-    const uint32_t cost_per_sm = total_cost / kNumSMs;
-    const uint32_t cost_remainder = total_cost % kNumSMs;
+    const uint32_t cost_per_sm = total_cost / num_sms;
+    const uint32_t cost_remainder = total_cost % num_sms;
     const auto locate = [&](const uint32_t& boundary_idx) -> Boundary {
         const uint32_t target = boundary_idx * cost_per_sm + cute::min(boundary_idx, cost_remainder);
         if (target == total_cost)
@@ -153,18 +151,32 @@ void sm100_mqa_logits_metadata(const uint32_t num_q_tokens, const uint32_t num_k
                                                 work_prefix[q_block_idx] - work_before - 1);
         return Boundary(make_uint2(q_block_idx, split_offset), work_before + split_offset);
     };
-    for (uint32_t sm_idx = thread_idx; sm_idx < kNumSMs; sm_idx += kNumThreads) {
+    for (uint32_t sm_idx = thread_idx; sm_idx < num_sms; sm_idx += kNumThreads) {
         const auto begin = locate(sm_idx);
         const auto end = locate(sm_idx + 1);
         reinterpret_cast<uint2*>(schedule_meta)[sm_idx] = begin.start;
-        schedule_meta[2 * kNumSMs + sm_idx] = end.work_offset - begin.work_offset;
+        schedule_meta[2 * num_sms + sm_idx] = end.work_offset - begin.work_offset;
     }
+}
+
+template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs,
+          uint32_t kSegmentCost, uint32_t kSplitCost, uint32_t kNumThreads>
+CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1)
+void sm100_mqa_logits_metadata(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
+                               const uint32_t* cu_seq_len_k_start,
+                               const uint32_t* cu_seq_len_k_end,
+                               uint32_t* schedule_meta) {
+    sm100_mqa_logits_metadata_impl<BLOCK_Q, SPLIT_KV, kSegmentCost, kSplitCost, kNumThreads>(
+        kNumSMs, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, schedule_meta);
 }
 
 // Emit tasks from this SM's grid-stride Q blocks or scheduled range
 template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs, bool kUseSchedule = false>
 struct SM100MQALogitsScheduler {
     static constexpr bool kIsPaged = false;
+
+    // A zero template argument selects the execution grid width at runtime.
+    CUTLASS_DEVICE static uint32_t grid_width() { return kNumSMs == 0 ? gridDim.x : kNumSMs; }
 
     uint32_t num_q_blocks;
     uint32_t num_q_tokens;
@@ -188,14 +200,13 @@ struct SM100MQALogitsScheduler {
             num_q_tokens(num_q_tokens), num_kv_tokens(num_kv_tokens),
             cu_seq_len_k_start(cu_seq_len_k_start), cu_seq_len_k_end(cu_seq_len_k_end),
             current_q_block_idx(sm_idx) {
-        DG_STATIC_ASSERT(kNumSMs > 0, "Invalid SM count");
         if constexpr (kUseSchedule) {
             const auto start = reinterpret_cast<const uint2*>(schedule_meta)[sm_idx];
             current_q_block_idx = start.x;
             current_split_offset = start.y;
-            remaining_splits = schedule_meta[2 * kNumSMs + sm_idx];
+            remaining_splits = schedule_meta[2 * grid_width() + sm_idx];
             kv_spans = reinterpret_cast<const MQALogitsKVSpan*>(
-                schedule_meta + get_mqa_logits_metadata_span_word_offset(kNumSMs));
+                schedule_meta + get_mqa_logits_metadata_span_word_offset(grid_width()));
         }
     }
 
@@ -241,7 +252,7 @@ struct SM100MQALogitsScheduler {
             if (current_q_block_idx >= num_q_blocks)
                 return false;
             const auto q_block_idx = current_q_block_idx;
-            current_q_block_idx += kNumSMs;
+            current_q_block_idx += grid_width();
             task.q_token_base = q_block_idx * BLOCK_Q;
             if constexpr (kLoadSeqBounds) {
                 // The bounds of the rows give the span, so load them only once
