@@ -4,6 +4,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
+#include <deep_gemm/common/fp4_dequant.cuh>
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
@@ -38,6 +39,8 @@ template <
     bool kPostNormHasWeight = false,
     float kPostNormEps = 1e-6f,
     bool kUseTrtllmWeights = false,
+    bool kWithFp4Weights = false,
+    MegaMoEActivation kActivation = MegaMoEActivation::SwiGLU,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -48,7 +51,8 @@ template <
     uint32_t kNumMMANonEpilogueWarps = kNumNonEpilogueThreads / 32,
     uint32_t kNumEpilogueWarps = kNumEpilogueThreads / 32,
     uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4,
-    uint32_t kNumThreads = kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
+    uint32_t kNumConvertThreads = kWithFp4Weights ? 128 : 0,
+    uint32_t kNumThreads = kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads + kNumConvertThreads,
     uint32_t kNumTokensPerWarp = 32 / kNumTopk,
     uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks,
     uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M,
@@ -90,6 +94,14 @@ sm100_bf16_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(not kUseTrtllmWeights or
                      (kHidden % 64 == 0 and kIntermediateHidden % 64 == 0 and BLOCK_K % 64 == 0),
                      "TRTLLM BF16 weights require complete 128-byte K blocks");
+
+    // W4A16: MXFP4 weights (e2m1, one UE8M0 scale per 32) are decoded into the BF16 B tiles in shared memory.
+    // NOTES: their scale maps ride in the shared-expert weight descriptor slots, so shared experts are excluded
+    DG_STATIC_ASSERT(not kWithFp4Weights or (not kUseTrtllmWeights and kNumSharedExperts == 0),
+                     "FP4 weights use the native layout without shared experts");
+    DG_STATIC_ASSERT(not kWithFp4Weights or BLOCK_K == 64, "FP4 weight decoding assumes one 128-byte BF16 atom per stage");
+    DG_STATIC_ASSERT(kActivation == MegaMoEActivation::SwiGLU or not kUseTrtllmWeights,
+                     "SiTU uses the native gate/up interleave");
 
     DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0,
                      "Post-expert norm does not support shared experts");
@@ -201,6 +213,26 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
 
+    // FP4 weight staging, placed after the BF16 storage so the BF16-weight layout is unchanged
+    // NOTES: the TMA weight warp fills `raw`/`sf`, the convert warpgroup decodes them into `smem_b`
+    constexpr uint32_t kNumFp4RawBytesPerStage = LOAD_BLOCK_N * BLOCK_K / 2;
+    constexpr uint32_t kNumFp4SFBytesPerStage = LOAD_BLOCK_N * (BLOCK_K / 32);
+    // NOTES: staged FP4 tiles are 4x smaller than BF16 tiles, so twice as many are kept in flight to cover memory
+    // latency, which the decode step lengthens
+    constexpr uint32_t kNumFp4RawStages = 2 * kNumStages;
+    struct Fp4WeightStorage {
+        alignas(kSharedMemoryAlignment) uint8_t raw[kNumFp4RawStages][kNumFp4RawBytesPerStage];
+        alignas(128) uint8_t sf[kNumFp4RawStages][kNumFp4SFBytesPerStage];
+        Barrier raw_full_barriers[kNumFp4RawStages];
+        Barrier raw_empty_barriers[kNumFp4RawStages];
+    };
+    constexpr uint32_t kFp4StorageOffset = math::constexpr_align<uint32_t>(sizeof(SharedStorage), kSharedMemoryAlignment);
+    Fp4WeightStorage &fp4_storage = *reinterpret_cast<Fp4WeightStorage*>(smem_buffer + kFp4StorageOffset);
+    if constexpr (kWithFp4Weights) {
+        // The host heuristic must reserve the staging storage
+        DG_DEVICE_ASSERT(kFp4StorageOffset + sizeof(Fp4WeightStorage) <= ptx::get_dynamic_smem_size());
+    }
+
     // Send buffers
     constexpr auto pull_layout = layout::Data(kNumBytesPerPull);
     const auto smem_send_buffers = layout::Buffer(
@@ -234,6 +266,14 @@ sm100_bf16_mega_moe_impl(void* y,
                 // Arrive at 2 CTAs, A + B
                 shared_storage.full_barriers[i].init(2 * 2);
                 shared_storage.empty_barriers[i].init(1);
+            }
+            if constexpr (kWithFp4Weights) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumFp4RawStages; ++ i) {
+                    // Local TMA arrival and local convert release
+                    fp4_storage.raw_full_barriers[i].init(1);
+                    fp4_storage.raw_empty_barriers[i].init(1);
+                }
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
@@ -286,6 +326,13 @@ sm100_bf16_mega_moe_impl(void* y,
         phase ^= stage_idx == 0;
     };
 
+    // FP4 staging pipeline, shared by the TMA weight warp and the convert warpgroup
+    uint32_t raw_stage_idx = 0, raw_phase = 0;
+    auto advance_raw_pipeline = [&]() {
+        raw_stage_idx = raw_stage_idx == kNumFp4RawStages - 1 ? 0 : raw_stage_idx + 1;
+        raw_phase ^= raw_stage_idx == 0;
+    };
+
     // Intra-SM Barrier indices
     constexpr uint32_t kDispatchBarrierIdx = 0;
     constexpr uint32_t kDispatchWithEpilogueBarrierIdx = 1;
@@ -298,13 +345,21 @@ sm100_bf16_mega_moe_impl(void* y,
 
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
+    // NOTES: FP4 weights add a convert warpgroup, which takes its registers from the other roles.
+    // `setmaxnreg` only redistributes the CTA's launch allocation, which is 96 registers per thread at 640 threads
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
-    constexpr uint32_t kNumDispatchRegisters = kUseMoreEpilogueRegisters ? 48 : 96;
-    constexpr uint32_t kNumNonEpilogueRegisters = kUseMoreEpilogueRegisters ? 40 : 88;
-    constexpr uint32_t kNumEpilogueRegisters = kUseMoreEpilogueRegisters ? 208 : 160;
+    constexpr uint32_t kNumDispatchRegisters = kWithFp4Weights ? (kUseMoreEpilogueRegisters ? 48 : 80) :
+                                                                 (kUseMoreEpilogueRegisters ? 48 : 96);
+    constexpr uint32_t kNumNonEpilogueRegisters = kWithFp4Weights ? (kUseMoreEpilogueRegisters ? 40 : 64) :
+                                                                    (kUseMoreEpilogueRegisters ? 40 : 88);
+    constexpr uint32_t kNumEpilogueRegisters = kWithFp4Weights ? (kUseMoreEpilogueRegisters ? 168 : 144) :
+                                                                 (kUseMoreEpilogueRegisters ? 208 : 160);
+    constexpr uint32_t kNumConvertRegisters = kUseMoreEpilogueRegisters ? 56 : 48;
+    constexpr uint32_t kNumLaunchRegisters = (65536 / kNumThreads) / 8 * 8 * kNumThreads;
     DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
                      kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
+                     kNumEpilogueRegisters * kNumEpilogueThreads +
+                     kNumConvertRegisters * kNumConvertThreads <= cute::min(64512u, kNumLaunchRegisters),
                      "Too many registers");
 
     // Grid sync index assignments (dispatch and epilogue use separate counters to avoid conflicts)
@@ -728,6 +783,30 @@ sm100_bf16_mega_moe_impl(void* y,
             const uint32_t half_n_idx = n_idx - half_idx * half_n, expert_idx = task_info.is_shared() ? 0 : task_info.local_expert_idx;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                if constexpr (kWithFp4Weights) {
+                    // Load packed FP4 and its scales into the staging stage for the convert warpgroup
+                    // NOTES: each CTA loads its own `LOAD_BLOCK_N` rows and arrives locally
+                    fp4_storage.raw_empty_barriers[raw_stage_idx].wait(raw_phase ^ 1);
+                    if (cute::elect_one_sync()) {
+                        const auto tensor_map_sf_ptr = task_info.block_phase == sched::BlockPhase::Linear1 ?
+                            &tensor_map_shared_l1_weights : &tensor_map_shared_l2_weights;
+                        const auto raw_full = reinterpret_cast<uint64_t*>(&fp4_storage.raw_full_barriers[raw_stage_idx]);
+                        const auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL);
+                        // Weights are pre-tiled so that each stage's FP4 tile and scale tile are contiguous,
+                        // viewed as 128-byte rows: `[expert, N / BLOCK_N, K / BLOCK_K, tile bytes]`
+                        const uint32_t tile_idx = (expert_idx * (shape_n / BLOCK_N) + n_block_idx) * num_k_blocks + k_block_idx;
+                        cute::SM90_TMA_LOAD_2D::copy(tensor_map_b_ptr, raw_full, cache_hint, fp4_storage.raw[raw_stage_idx],
+                                                     0, tile_idx * (kNumFp4RawBytesPerStage / 128));
+                        cute::SM90_TMA_LOAD_2D::copy(tensor_map_sf_ptr, raw_full, cache_hint, fp4_storage.sf[raw_stage_idx],
+                                                     0, tile_idx * (kNumFp4SFBytesPerStage / 128));
+                        fp4_storage.raw_full_barriers[raw_stage_idx].arrive_and_expect_tx(
+                            kNumFp4RawBytesPerStage + kNumFp4SFBytesPerStage);
+                    }
+                    __syncwarp();
+                    advance_raw_pipeline();
+                    continue;
+                }
+
                 // Wait consumer release
                 shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
 
@@ -875,6 +954,81 @@ sm100_bf16_mega_moe_impl(void* y,
         // Do mainloop by the leader CTA
         if (is_leader_cta)
             scheduler.mainloop(num_tokens, sm_locality_domains);
+    } else if (kWithFp4Weights and warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps + kNumEpilogueWarps) {
+        // Adjust registers
+        cutlass::arch::warpgroup_reg_dealloc<kNumConvertRegisters>();
+
+        // FP4 weight convert warpgroup: decode each staged FP4 tile into the BF16 B tile the MMA reads
+        // NOTES: the output layout matches a 128B-swizzled K-major TMA load of `LOAD_BLOCK_N x BLOCK_K` BF16,
+        // i.e. 16-byte chunk `c` of row `r` lives at `r * 128 + (c ^ (r % 8)) * 16`.
+        // Each warp converts whole stages, round-robin, so that 4 stages are decoded concurrently and the
+        // per-stage barrier, fence and cluster-arrive latencies overlap.
+        if constexpr (kWithFp4Weights) {
+            constexpr uint32_t kNumConvertWarps = kNumConvertThreads / 32;
+            constexpr uint32_t kNumChunksPerRow = BLOCK_K * sizeof(nv_bfloat16) / 16;
+            constexpr uint32_t kNumElemsPerChunk = 16 / sizeof(nv_bfloat16);
+            constexpr uint32_t kNumChunksPerSF = 32 / kNumElemsPerChunk;
+            constexpr uint32_t kNumChunksPerLane = LOAD_BLOCK_N * kNumChunksPerRow / 32;
+            constexpr uint32_t kNumChunksPerBatch = 8;
+            DG_STATIC_ASSERT(kNumChunksPerRow == 8, "Invalid BF16 swizzle atom");
+            DG_STATIC_ASSERT(kNumChunksPerLane % kNumChunksPerBatch == 0, "Invalid convert batch");
+            const uint32_t convert_warp_idx = (thread_idx - (kNumThreads - kNumConvertThreads)) / 32;
+
+            uint32_t iter_idx = 0;
+            task_info_t task_info;
+            while (scheduler.get_next_task(task_info)) {
+                const auto num_k_blocks = math::ceil_div(task_info.shape_k, BLOCK_K);
+                for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                    const auto current_raw_stage_idx = raw_stage_idx, current_raw_phase = raw_phase;
+                    advance_raw_pipeline();
+                    if ((iter_idx ++) % kNumConvertWarps != convert_warp_idx)
+                        continue;
+
+                    // Wait for the staged FP4 tile and for the MMA to release the BF16 tile
+                    fp4_storage.raw_full_barriers[current_raw_stage_idx].wait(current_raw_phase);
+                    shared_storage.empty_barriers[stage_idx].wait(phase ^ 1);
+
+                    // A warp covers 4 rows per chunk step: 128 contiguous FP4 bytes in, 512 swizzled BF16 bytes out
+                    // NOTES: loads of a batch are issued together so their latency is paid once per batch
+                    const auto raw = fp4_storage.raw[current_raw_stage_idx];
+                    const auto sf = fp4_storage.sf[current_raw_stage_idx];
+                    const auto dst = reinterpret_cast<uint8_t*>(shared_storage.smem_b[stage_idx]);
+                    #pragma unroll 1
+                    for (uint32_t b = 0; b < kNumChunksPerLane / kNumChunksPerBatch; ++ b) {
+                        uint32_t packed[kNumChunksPerBatch], sf_exps[kNumChunksPerBatch];
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumChunksPerBatch; ++ i) {
+                            const uint32_t chunk_idx = (b * kNumChunksPerBatch + i) * 32 + lane_idx;
+                            const uint32_t row = chunk_idx / kNumChunksPerRow, col = chunk_idx % kNumChunksPerRow;
+                            packed[i] = ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                raw + row * (BLOCK_K / 2) + col * (kNumElemsPerChunk / 2)));
+                            sf_exps[i] = sf[(col / kNumChunksPerSF) * LOAD_BLOCK_N + row];
+                        }
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kNumChunksPerBatch; ++ i) {
+                            const uint32_t chunk_idx = (b * kNumChunksPerBatch + i) * 32 + lane_idx;
+                            const uint32_t row = chunk_idx / kNumChunksPerRow, col = chunk_idx % kNumChunksPerRow;
+                            const auto values = fp4::e2m1x8_to_bf16x8_scaled(packed[i], sf_exps[i]);
+                            const auto dst_ptr = reinterpret_cast<uint4*>(dst + row * 128 + ((col ^ (row % 8)) * 16));
+                            ptx::st_shared(dst_ptr, values.x, values.y, values.z, values.w);
+                        }
+                    }
+
+                    // Make the generic-proxy writes visible to the MMA, then release the staging stage
+                    cutlass::arch::fence_view_async_shared();
+                    __syncwarp();
+                    if (cute::elect_one_sync()) {
+                        fp4_storage.raw_empty_barriers[current_raw_stage_idx].arrive();
+                        if (is_leader_cta) {
+                            shared_storage.full_barriers[stage_idx].arrive();
+                        } else {
+                            shared_storage.full_barriers[stage_idx].arrive(0u);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
@@ -1004,6 +1158,24 @@ sm100_bf16_mega_moe_impl(void* y,
                         constexpr uint32_t kUpOff = 2u - kGateOff;
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
+                            if constexpr (kActivation == MegaMoEActivation::SiTU) {
+                                // SiTU on the FP32 accumulator: 4 * tanh(gate / 4) * sigmoid(gate) * 25 * tanh(up / 25)
+                                // NOTES: unlike SwiGLU below, gate/up are not rounded to BF16 first
+                                const auto situ = [](float g, float u) {
+                                    if constexpr (kActivationClamp != cute::numeric_limits<float>::infinity()) {
+                                        g = fminf(g, kActivationClamp);
+                                        u = fmaxf(fminf(u, kActivationClamp), -kActivationClamp);
+                                    }
+                                    const float sigmoid = 1.0f / (1.0f + (kFastMath ? __expf(-g) : expf(-g)));
+                                    return (4.0f * tanhf(g * 0.25f)) * sigmoid * (25.0f * tanhf(u * 0.04f));
+                                };
+                                const float* gate = fp32_values + k * 4 + kGateOff;
+                                const float* up = fp32_values + k * 4 + kUpOff;
+                                bf16x2_output[i * 2 + k] = __float22bfloat162_rn(
+                                    __fmul2_rn(make_float2(situ(gate[0], up[0]), situ(gate[1], up[1])), weights));
+                                continue;
+                            }
+
                             auto bf16_gate = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kGateOff], fp32_values[k * 4 + kGateOff + 1]));
                             auto bf16_up = __float22bfloat162_rn(make_float2(fp32_values[k * 4 + kUpOff], fp32_values[k * 4 + kUpOff + 1]));
 
@@ -1214,7 +1386,8 @@ sm100_bf16_mega_moe_impl(void* y,
 
         // 3 slots of chunk is needed: 2 load stages and 1 store
         constexpr uint32_t kNumChunkSlots = 3;
-        constexpr uint32_t kNumMaxRegistersForBuffer = 128;
+        // NOTES: the convert warpgroup leaves the epilogue fewer registers with many local experts
+        constexpr uint32_t kNumMaxRegistersForBuffer = kWithFp4Weights and not kUseMoreEpilogueRegisters ? 64 : 128;
 
         // NOTES: either 1 or 2 chunks for simplicity
         // NOTES: Restrict on both smem and register

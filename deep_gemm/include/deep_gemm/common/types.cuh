@@ -31,6 +31,14 @@ constexpr CUTLASS_HOST_DEVICE int get_sf_gran_k(const MmaKind& mma_kind) {
     }
 }
 
+// Gated activation applied to the MegaMoE L1 (gate/up) output
+// - SwiGLU: silu(gate) * up
+// - SiTU: 4 * tanh(gate / 4) * sigmoid(gate) * 25 * tanh(up / 25), in FP32 (Kimi K3)
+enum class MegaMoEActivation : uint32_t {
+    SwiGLU = 0,
+    SiTU   = 1,
+};
+
 enum class GemmType {
     Normal                              = 0,
     MGroupedContiguous                  = 1,

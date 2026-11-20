@@ -335,6 +335,64 @@ public:
         return maps;
     }
 
+    // A contiguous byte tensor viewed as 128-byte rows, loaded `box_rows` rows at a time without swizzling
+    CUtensorMap make_tma_rows_desc(const TensorView &t, int64_t num_bytes, int box_rows) {
+        DG_HOST_ASSERT(t.element_size() == 1 and t.is_contiguous());
+        DG_HOST_ASSERT(reinterpret_cast<std::uintptr_t>(t.data_ptr()) % 128u == 0u);
+        DG_HOST_ASSERT(num_bytes % 128 == 0 and num_bytes / 128 < (1ll << 32));
+        CUtensorMap result;
+        const cuuint64_t dims[2] = {128, static_cast<cuuint64_t>(num_bytes / 128)};
+        const cuuint64_t strides[1] = {128};
+        const cuuint32_t box[2] = {128, static_cast<cuuint32_t>(box_rows)};
+        const cuuint32_t element_strides[2] = {1, 1};
+        check(encode_(&result, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, t.data_ptr(), dims, strides, box, element_strides,
+                      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+        return result;
+    }
+
+    // BF16 activations with MXFP4 weights (W4A16). Weights are e2m1 bytes (low nibble is the even element) and
+    // scales are UE8M0 bytes, both pre-tiled per `block_n x block_k` stage so that a stage is one contiguous load:
+    // weights `[experts, N / block_n, K / block_k, block_n, block_k / 2]`,
+    // scales `[experts, N / block_n, K / block_k, block_k / 32, block_n]`.
+    // L1 rows keep the BF16 kernel's gate/up interleave with granularity 8.
+    MegaMoETensorMaps make_bf16_fp4_mega_moe_maps(const MegaMoEConfig &config, const TensorView &l1_acts,
+                                                  const TensorView &l1_weights, const TensorView &l1_weights_sf,
+                                                  const TensorView &l2_acts, const TensorView &l2_weights,
+                                                  const TensorView &l2_weights_sf, int hidden, int intermediate_hidden,
+                                                  int num_experts_per_rank) {
+        DG_HOST_ASSERT(config.block_k == 64 and config.load_block_n == config.block_n and config.block_n == 128);
+        MegaMoETensorMaps maps;
+        maps.tensor_map_l1_acts =
+            make_tma_2d_desc(l1_acts, hidden, config.num_ring_tokens, config.block_k, config.load_block_m,
+                             static_cast<int>(l1_acts.stride(-2)), config.swizzle_acts_mode);
+        maps.tensor_map_l1_output =
+            make_tma_2d_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_n / 2,
+                             config.store_block_m_l1, static_cast<int>(l2_acts.stride(-2)), config.swizzle_acts_mode);
+        maps.tensor_map_l2_acts =
+            make_tma_2d_desc(l2_acts, intermediate_hidden, config.num_ring_tokens, config.block_k, config.load_block_m,
+                             static_cast<int>(l2_acts.stride(-2)), config.swizzle_acts_mode);
+        const int tile_bytes = config.block_n * config.block_k / 2, sf_tile_bytes = config.block_n * config.block_k / 32;
+        const auto weights = [&](const TensorView &w, int n, int k) {
+            return make_tma_rows_desc(w, static_cast<int64_t>(num_experts_per_rank) * n * k / 2, tile_bytes / 128);
+        };
+        const auto scales = [&](const TensorView &sf, int n, int k) {
+            return make_tma_rows_desc(sf, static_cast<int64_t>(num_experts_per_rank) * n * k / 32, sf_tile_bytes / 128);
+        };
+        maps.tensor_map_l1_weights = weights(l1_weights, intermediate_hidden * 2, hidden);
+        maps.tensor_map_l1_weights_sf = scales(l1_weights_sf, intermediate_hidden * 2, hidden);
+        maps.tensor_map_l2_weights = weights(l2_weights, hidden, intermediate_hidden);
+        maps.tensor_map_l2_weights_sf = scales(l2_weights_sf, hidden, intermediate_hidden);
+
+        // No shared experts: the kernel reads the scale maps from the shared weight slots
+        maps.tensor_map_shared_l1_acts = maps.tensor_map_l1_acts;
+        maps.tensor_map_shared_l1_output = maps.tensor_map_l1_output;
+        maps.tensor_map_shared_l2_acts = maps.tensor_map_l2_acts;
+        maps.tensor_map_shared_l1_weights = maps.tensor_map_l1_weights_sf;
+        maps.tensor_map_shared_l2_weights = maps.tensor_map_l2_weights_sf;
+        return maps;
+    }
+
     MegaMoETensorMaps make_fp4_mega_moe_maps(const MegaMoEConfig &config, const TensorView &l1_acts,
                                              const TensorView &l1_acts_sf, const TensorView &l1_weights,
                                              const TensorView &l1_weights_sf, const TensorView &l2_acts,

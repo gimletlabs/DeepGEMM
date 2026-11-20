@@ -233,3 +233,58 @@ def bf16_mega_moe(y: torch.Tensor,
         fast_math, post_expert_norm, post_expert_norm_weight, post_expert_norm_eps,
         post_expert_norm_weight_first, use_trtllm_weights
     )
+
+
+def transform_fp4_weights_for_bf16_mega_moe(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    block_n: int = 128, block_k: int = 64
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """MXFP4 weights for the W4A16 (BF16 x MXFP4) kernel.
+
+    Inputs are `(packed, scale)` pairs: packed e2m1 bytes `[E, N, K / 2]` (low nibble is the even element) and UE8M0
+    scale bytes `[E, N, K / 32]`, with L1 rows ordered `[gate; up]`. L1 rows get the gate/up interleave of granularity
+    8. Both are then tiled per `block_n x block_k` kernel stage so that each stage is one contiguous load:
+    weights `[E, N / block_n, K / block_k, block_n, block_k / 2]`, scales `[E, N / block_n, K / block_k, block_k / 32,
+    block_n]`. Weight values are not changed.
+    """
+    def as_bytes(t: torch.Tensor) -> torch.Tensor:
+        assert t.element_size() == 1 and t.dim() == 3
+        return t.view(torch.uint8)
+
+    def tile(w: torch.Tensor, sf: torch.Tensor):
+        e, n, half_k = w.shape
+        k = half_k * 2
+        assert n % block_n == 0 and k % block_k == 0 and sf.shape == (e, n, k // 32)
+        w = w.reshape(e, n // block_n, block_n, k // block_k, block_k // 2).permute(0, 1, 3, 2, 4).contiguous()
+        sf = sf.reshape(e, n // block_n, block_n, k // block_k, block_k // 32).permute(0, 1, 3, 4, 2).contiguous()
+        return w, sf
+
+    l1_w, l1_sf = l1_weights
+    l2_w, l2_sf = l2_weights
+    l1 = tile(_interleave_weights(as_bytes(l1_w)), _interleave_weights(as_bytes(l1_sf)))
+    l2 = tile(as_bytes(l2_w), as_bytes(l2_sf))
+    return l1, l2
+
+
+def bf16_fp4_mega_moe(y: torch.Tensor,
+                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                      sym_buffer: SymmBuffer,
+                      cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                      activation: str = 'swiglu',
+                      activation_clamp: Optional[float] = None,
+                      fast_math: bool = True):
+    """BF16 activations with MXFP4 weights; the weights come from `transform_fp4_weights_for_bf16_mega_moe`."""
+    assert sym_buffer.mma_type == 'bf16xbf16'
+    _C.bf16_fp4_mega_moe(
+        y, l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        sym_buffer.num_topk,
+        activation, activation_clamp, fast_math
+    )
