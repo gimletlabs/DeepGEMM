@@ -28,7 +28,6 @@ class SymmBuffer:
         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
         # Init
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -149,7 +148,7 @@ def transform_weights_for_mega_moe(
     activation: str = 'swiglu'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+    assert activation in ('swiglu', 'situ'), f'Unsupported activation: {activation}'
     if isinstance(l1_weights, tuple):
         # FP8/FP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
         l1_w = _interleave_weights(l1_weights[0])

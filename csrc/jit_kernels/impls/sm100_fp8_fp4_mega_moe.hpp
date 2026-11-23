@@ -42,7 +42,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& post_norm_weight_first,
     const float& post_norm_eps,
     const MmaKind& mma_kind,
-    const bool& use_trtllm_weights = false
+    const bool& use_trtllm_weights = false,
+    const bool& use_situ = false
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -119,7 +120,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {}, {}, {}, {}, {},
-        {}, {}, {}, {}, {}
+        {}, {}, {}, {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -147,7 +148,8 @@ static void __instantiate_kernel() {{
     post_norm_weight_first ? "true" : "false",
     post_expert_norm_weight != nullptr ? "true" : "false",
     to_string(post_norm_eps),
-    use_trtllm_weights ? "true" : "false"));
+    use_trtllm_weights ? "true" : "false",
+    use_situ ? "true" : "false"));
     host::with_fp4_mega_moe_args(
         [&](const auto&... args) {
             jit->launch(

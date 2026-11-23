@@ -48,7 +48,7 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(num_shared_experts >= 0);
 
     const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
@@ -194,7 +194,6 @@ static void fp8_fp4_mega_moe(
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
     DG_HOST_ASSERT(not use_x_scales or mma_kind == MmaKind::NVFP4);
     DG_HOST_ASSERT(not use_trtllm_weights or mma_kind == MmaKind::NVFP4);
-    DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // FP4 activations use flat 2D weight descriptors, unlike the existing FP8 path.
@@ -207,9 +206,12 @@ static void fp8_fp4_mega_moe(
     }
 
     // Activation checks
+    const bool use_situ = activation == "situ";
+    DG_HOST_ASSERT(activation == "swiglu" or use_situ);
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(not use_situ or activation_clamp == std::numeric_limits<float>::infinity());
 
     // Tensor checks
     const auto arch_major = jit->device.get_arch_major();
@@ -362,7 +364,7 @@ static void fp8_fp4_mega_moe(
                                post_expert_norm_weight_first,
                                post_expert_norm_eps,
                                mma_kind,
-                               use_trtllm_weights);
+                               use_trtllm_weights, use_situ);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
