@@ -46,6 +46,7 @@ template <
     bool kPostNormHasWeight = false,
     float kPostNormEps = 0.0f,
     bool kUseTrtllmWeights = false,
+    bool kUseSitu = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -1302,7 +1303,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if constexpr (kWithL2ActScales)
                             weights = __fmul2_rn(weights, {l2_act_gs, l2_act_gs});
 
-                        // Apply SwiGLU: silu(gate) * up
+                        // Round both FC1 branches to BF16 before the gated activation.
                         auto fp32_values = reinterpret_cast<float2*>(store_block_raw_values[i]);
                         constexpr uint32_t kGateSlot = kUseTrtllmWeights ? 1u : 0u;
                         constexpr uint32_t kUpSlot = 1u - kGateSlot;
@@ -1334,6 +1335,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 sig = {1.0f / denom.x, 1.0f / denom.y};
                             }
                             auto up = __bfloat1622float2(bf16_up);
+                            if constexpr (kUseSitu) {
+                                // Kimi SiTU soft-clips each branch before applying the routing weight.
+                                constexpr float beta = 4.0f, linear_beta = 25.0f;
+                                gate = {beta * tanhf(gate.x / beta), beta * tanhf(gate.y / beta)};
+                                up = {linear_beta * tanhf(up.x / linear_beta),
+                                      linear_beta * tanhf(up.y / linear_beta)};
+                            }
                             gate = __fmul2_rn(gate, sig);
                             activation_values[i][k] = __fmul2_rn(__fmul2_rn(gate, up), weights);
                         }
