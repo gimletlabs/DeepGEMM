@@ -20,6 +20,12 @@ CUTLASS_DEVICE uint32_t get_lane_idx() {
     return lane_id;
 }
 
+CUTLASS_DEVICE uint32_t get_dynamic_smem_size() {
+    uint32_t num_bytes;
+    asm ("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_bytes));
+    return num_bytes;
+}
+
 CUTLASS_DEVICE uint64_t get_grid_idx() {
     uint64_t grid_idx;
     asm volatile("mov.u64 %0, %%gridid;" : "=l"(grid_idx));

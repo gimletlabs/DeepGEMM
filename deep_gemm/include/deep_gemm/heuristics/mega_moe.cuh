@@ -36,6 +36,9 @@ struct MegaMoEConfig {
     // Dispatch pull config
     int num_bytes_per_pull;
 
+    // FP4 weight convert warpgroup (W4A16 only)
+    int num_convert_threads = 0;
+
     friend std::ostream& operator << (std::ostream& os, const MegaMoEConfig& config) {
         os << "MegaMoEConfig("
            << "block_m=" << config.block_m << ", block_n=" << config.block_n << ", block_k=" << config.block_k
@@ -50,7 +53,10 @@ struct MegaMoEConfig {
            << ", num_dispatch_threads=" << config.num_dispatch_threads
            << ", num_non_epilogue_threads=" << config.num_non_epilogue_threads
            << ", num_epilogue_threads=" << config.num_epilogue_threads
-           << ", num_bytes_per_pull=" << config.num_bytes_per_pull << ")";
+           << ", num_bytes_per_pull=" << config.num_bytes_per_pull;
+        if (config.num_convert_threads > 0)
+            os << ", num_convert_threads=" << config.num_convert_threads;
+        os << ")";
         return os;
     }
 };
@@ -110,7 +116,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& num_bytes_per_pull, const int& store_block_m_l1, const int& store_block_m_l2,
     const int& sf_block_m, const int& sf_block_n, const int& gran_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind, const bool& with_fp4_weights = false) {
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
@@ -160,13 +166,20 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
-    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers;
+    // BF16 activations with MXFP4 weights also stage packed FP4, one UE8M0 byte per 32, and two barriers,
+    // with two staging slots per MMA stage
+    const int smem_fp4_weights_per_stage = with_fp4_weights ? 2 * (block_n * block_k / 2 + block_n * (block_k / 32) + 2 * 8) : 0;
+    DG_HOST_ASSERT(not with_fp4_weights or (mma_kind == MmaKind::BF16 and (block_n * block_k / 2) % kSmemAlignment == 0));
+    const int smem_size_per_stage = smem_a_size_per_stage + smem_b_size_per_stage + smem_sfa_per_stage + smem_sfb_per_stage + smem_stage_barriers +
+        smem_fp4_weights_per_stage;
 
     const int smem_sf_inv_lut = mma_kind == MmaKind::NVFP4 ? 256 * sizeof(float) : 0;
 
     // Fixed total
+    // NOTES: the FP4 staging storage starts on the next alignment boundary after the BF16 storage,
+    // and its own size is padded to that alignment
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
-        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
+        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut + (with_fp4_weights ? 2 * kSmemAlignment : 0);
 
     // Select maximum number of stages
     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
@@ -181,7 +194,8 @@ static MegaMoEConfig compute_mega_moe_config(
     const int& hidden, const int& intermediate_hidden,
     const int& num_ring_tokens,
     const int& num_sf_ring_tokens,
-    const MmaKind& mma_kind) {
+    const MmaKind& mma_kind,
+    const bool& with_fp4_weights = false) {
 
     // Block config
     const auto [cluster_size, block_m, store_block_m_l1, store_block_m_l2, block_k, num_epilogue_threads] =
@@ -217,7 +231,7 @@ static MegaMoEConfig compute_mega_moe_config(
         block_m, block_n, block_k, num_bytes_per_pull, store_block_m_l1, store_block_m_l2,
         sf_block_m, sf_block_n, gran_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
-        mma_kind);
+        mma_kind, with_fp4_weights);
 
     const auto config = MegaMoEConfig {
         block_m, block_n, block_k,
@@ -227,7 +241,8 @@ static MegaMoEConfig compute_mega_moe_config(
         swizzle_acts_mode, swizzle_weights_mode,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-        num_bytes_per_pull
+        num_bytes_per_pull,
+        with_fp4_weights ? 128 : 0
     };
 
     return config;

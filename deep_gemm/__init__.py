@@ -92,6 +92,8 @@ from .mega import (
     transform_weights_for_mega_moe,
     fp8_fp4_mega_moe,
     bf16_mega_moe,
+    bf16_fp4_mega_moe,
+    transform_fp4_weights_for_bf16_mega_moe,
 )
 
 # Epilogue classes

@@ -506,6 +506,75 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
+// BF16 activations with MXFP4 weights (W4A16): `l1_weights`/`l2_weights` are (e2m1 bytes, UE8M0 scale bytes)
+// pre-tiled per 128 x 64 stage by `transform_fp4_weights_for_bf16_mega_moe`:
+// weights `[E, N / 128, K / 64, 128, 32]`, scales `[E, N / 128, K / 64, 2, 128]`.
+// The symmetric buffer uses the `bf16xbf16` layout.
+static void bf16_fp4_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math
+) {
+    const auto num_tokens = static_cast<int>(y.size(0));
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+
+    const auto& [l1_w, l1_sf] = l1_weights;
+    const auto& [l2_w, l2_sf] = l2_weights;
+    const auto check_tiles = [&](const torch::Tensor& w, const torch::Tensor& sf) {
+        DG_HOST_ASSERT(w.dim() == 5 and w.is_contiguous() and w.element_size() == 1 and w.device() == y.device());
+        DG_HOST_ASSERT(sf.dim() == 5 and sf.is_contiguous() and sf.element_size() == 1 and sf.device() == y.device());
+        DG_HOST_ASSERT(w.size(3) == 128 and w.size(4) == 32 and sf.size(3) == 2 and sf.size(4) == 128);
+        for (int i = 0; i < 3; ++ i)
+            DG_HOST_ASSERT(w.size(i) == sf.size(i));
+        // Returns (experts, N, K)
+        return std::make_tuple(static_cast<int>(w.size(0)), static_cast<int>(w.size(1)) * 128, static_cast<int>(w.size(2)) * 64);
+    };
+    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = check_tiles(l1_w, l1_sf);
+    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = check_tiles(l2_w, l2_sf);
+    DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_ and hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(y.scalar_type() == torch::kBFloat16 and y.size(1) == hidden);
+
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
+    }
+
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(num_experts == num_experts_per_rank * num_ranks);
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, "bf16xbf16", "swiglu", 0);
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+
+    const auto [x, _x_sf, topk_idx, topk_weights,
+                shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, _shared_l2_acts_sf,
+                l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf, _x_scales] = slice(sym_buffer);
+
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+    const auto flat = [](const torch::Tensor& t) { return t.view({t.size(0), -1}); };
+    sm100_bf16_fp4_mega_moe(y, l1_acts, l2_acts,
+                            flat(l1_w), flat(l1_sf), flat(l2_w), flat(l2_sf),
+                            locality_domain::get_balanced_sm_locality_domains(),
+                            cumulative_local_expert_recv_stats,
+                            sym_buffer_ptrs, rank_idx, num_max_tokens_per_rank,
+                            num_experts_per_rank, num_tokens, num_topk,
+                            hidden, intermediate_hidden,
+                            activation_clamp, fast_math,
+                            activation == "situ" ? MegaMoEActivation::SiTU : MegaMoEActivation::SwiGLU);
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe,
@@ -515,6 +584,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
+    m.def("bf16_fp4_mega_moe", &bf16_fp4_mega_moe);
     m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
           pybind11::arg("x"),
           pybind11::arg("topk_idx"),
